@@ -113,7 +113,7 @@ class Simulator:
         except FileNotFoundError:
             pass
         if not targets:
-            targets.append((0.0, 0.0, 0.0, 0.0))
+            targets.append((-2, 2, 2, 1.57))
         return targets
 
     def compute_dynamics(self, rpm_values, lin_vel_world, quat):
