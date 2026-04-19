@@ -50,9 +50,9 @@ import math
 # I — slow correction for residual offset (wind primarily handled by DOBC)
 # D — damp oscillations; operates on a filtered derivative to reduce noise
 # -----------------------------------------------------------------------
-POS_KP = [0.65, 0.65, 1.2,  2.8 ]
-POS_KI = [0.05, 0.05, 0.10, 0.07]
-POS_KD = [0.60, 0.60, 0.22, 0.05]
+POS_KP = [1.0,  1.0,  1.3,  2.2 ]
+POS_KI = [0.0,  0.0,  0.10, 0.07]
+POS_KD = [0.55, 0.55, 0.38, 0.10]
 
 # -----------------------------------------------------------------------
 # Speed limits (must match the simulator's internal clip values)
@@ -66,7 +66,7 @@ YAW_MAX = 1.745  # rad/s — maximum yaw rate
 # close to the target.  During a long-range approach the proportional
 # term is saturated at VEL_MAX, so integrating would cause overshoot.
 # -----------------------------------------------------------------------
-INTEG_DIST_THRESH = 0.6   # metres  — activate integral only when already close
+INTEG_DIST_THRESH = 0.4   # metres  — activate integral only when already close
 INTEG_YAW_THRESH  = 0.3   # radians — yaw error gate for yaw integral
 POS_INTEG_MAX     = 1.2   # maximum integral magnitude (m·s)
 
@@ -75,7 +75,7 @@ POS_INTEG_MAX     = 1.2   # maximum integral magnitude (m·s)
 # Smooths the raw Δerror/Δt signal before using it as the D term.
 # Higher α → smoother but slower derivative response.
 # -----------------------------------------------------------------------
-DERIV_ALPHA = 0.65   # heavier filter; KD raised above to compensate for the attenuation
+DERIV_ALPHA = 0.50   # balanced filter: responsive enough for D braking, smooth enough to reduce noise
 
 # -----------------------------------------------------------------------
 # DOBC parameters
@@ -89,15 +89,27 @@ DOBC_ALPHA = 0.98
 # DOBC_GAIN: how much of the wind estimate to subtract.
 #   0.8 < 1.0 adds a small safety margin against velocity-estimate noise
 #   near the setpoint where last_cmd ≈ 0 and disturbance calc is noisiest.
-DOBC_GAIN = 0.8
+DOBC_GAIN = 0.5
 
 # DOBC_MAX: hard cap on the wind compensation magnitude (m/s per axis).
 #   Prevents a corrupted wind_est from overwhelming the PID command.
-DOBC_MAX = 0.25
+DOBC_MAX = 0.6
 
 # VEL_EST_ALPHA: pre-filter for the raw Δpos/Δt velocity estimate.
 #   Heavier filter (0.7) reduces quantisation noise before DOBC disturbance calc.
 VEL_EST_ALPHA = 0.7
+
+# -----------------------------------------------------------------------
+# Proximity braking
+# When the drone is within BRAKE_RADIUS of the target, the maximum
+# allowed velocity is scaled down linearly from VEL_MAX to
+# BRAKE_MIN_FRAC * VEL_MAX.  This prevents a fast initial approach from
+# building enough momentum to overshoot the setpoint and oscillate.
+# The D term handles small residual damping; braking handles large-scale
+# overshoot from the transient approach phase.
+# -----------------------------------------------------------------------
+BRAKE_RADIUS   = 0.5   # metres — start tapering max speed inside this radius
+BRAKE_MIN_FRAC = 0.20  # floor: 20% of VEL_MAX even at zero distance
 
 # -----------------------------------------------------------------------
 # Persistent state — survives across controller calls
@@ -223,11 +235,20 @@ def controller(state, target_pos, dt, wind_enabled=False):
                     + POS_KI[3] * pos_integral[3]
                     + POS_KD[3] * pos_d_filtered[3])
 
-    # Clamp to simulator speed limits before DOBC
-    vx_pid       = max(-VEL_MAX, min(VEL_MAX, vx_pid))
-    vy_pid       = max(-VEL_MAX, min(VEL_MAX, vy_pid))
-    vz_pid       = max(-VEL_MAX, min(VEL_MAX, vz_pid))
-    yaw_rate_pid = max(-YAW_MAX, min(YAW_MAX, yaw_rate_pid))
+    # Proximity braking: reduce the velocity ceiling as the drone nears the
+    # setpoint.  This prevents a fast approach from overshooting and then
+    # oscillating on the far side of the target.
+    # Inside BRAKE_RADIUS the ceiling falls linearly to BRAKE_MIN_FRAC * VEL_MAX.
+    # Outside it is the standard VEL_MAX.
+    if dist_3d < BRAKE_RADIUS:
+        bfrac = max(BRAKE_MIN_FRAC, dist_3d / BRAKE_RADIUS)
+        v_lim = VEL_MAX * bfrac
+    else:
+        v_lim = VEL_MAX
+    vx_pid       = max(-v_lim,    min(v_lim,    vx_pid))
+    vy_pid       = max(-v_lim,    min(v_lim,    vy_pid))
+    vz_pid       = max(-v_lim,    min(v_lim,    vz_pid))
+    yaw_rate_pid = max(-YAW_MAX,  min(YAW_MAX,  yaw_rate_pid))
 
     # ===================================================================
     # STEP 5 — DOBC: Disturbance Observer-Based Feedforward Compensation
@@ -257,8 +278,15 @@ def controller(state, target_pos, dt, wind_enabled=False):
         # (c) Disturbance = observed velocity − last commanded velocity
         #   Positive: drone moved faster than commanded → tailwind in that axis
         #   Negative: drone moved slower than commanded → headwind in that axis
-        disturbance_x = vel_est[0] - last_cmd[0]
-        disturbance_y = vel_est[1] - last_cmd[1]
+        if dist_3d < 0.8:
+            disturbance_x = vel_est[0] - last_cmd[0]
+            disturbance_y = vel_est[1] - last_cmd[1]
+        else:
+            # When far from the target, the drone may be accelerating towards it
+            # and the disturbance estimate becomes unreliable.  In that case,
+            # we skip the disturbance update to avoid corrupting the wind_est.
+            disturbance_x = 0.0
+            disturbance_y = 0.0
 
         # (d) Heavy EMA (α = 0.98): time constant ≈ dt/(1−α) ≈ 2.5 s at 20 Hz.
         #   Only a truly persistent (steady-state) bias survives the filter.
