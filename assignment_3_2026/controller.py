@@ -1,31 +1,63 @@
+wind_enabled = True   # Set True → simulator applies wind disturbances during marking
+
 import math
 
 # =====================================================================
-# OUTER POSITION CONTROLLER  (runs at 20 Hz via run.py)
+# CASCADE PID POSITION CONTROLLER  (runs at 20 Hz via run.py)
 #
-# This is the "outer loop" of a cascaded control system:
-#   Outer loop (HERE):  position error  →  velocity setpoint
-#   Inner loop (tello_controller.py):  velocity setpoint  →  motor RPMs
+# Advanced method: 3-layer Cascade PID controller.
 #
-# For each axis we use a PI controller:
-#   P (Proportional): react immediately to the current position error
-#   I (Integral):     slowly correct any small residual offset
+#   Layer 1 (Outer — Position PID):
+#       Input:  position error = target_pos - current_pos
+#       Output: desired velocity setpoint (world frame)
+#       This outer loop tells the drone how fast to move in each axis
+#       to close the gap between current and target position.
+#
+#   Layer 2 (Middle — Velocity PI):
+#       Input:  velocity error = desired_velocity - estimated_velocity
+#       Output: refined velocity correction
+#       Estimated velocity is computed from position differences (Δpos / Δt).
+#       This middle loop corrects any mismatch between the commanded
+#       velocity and what the drone is actually achieving.
+#
+#   Layer 3 (Inner — handled by tello_controller.py):
+#       Input:  final velocity command from Layer 2
+#       Output: attitude → rate → motor RPMs
+#       This hardware-level cascade executes the velocity commands.
+#
+# For each axis we use a PID (or PI) controller:
+#   P (Proportional): react immediately to the current error
+#   I (Integral):     slowly correct any small residual offset (e.g. from wind)
+#   D (Derivative):   damp oscillations by reacting to error rate of change
 #
 # The output is a 4-element tuple: (vx, vy, vz, yaw_rate)
 # expressed in the drone's yaw-body frame (not world frame).
 # =====================================================================
 
-# --- Proportional gains [x, y, z, yaw] ---
-# Increase to fly toward the target faster and hold position more tightly.
+# -----------------------------------------------------------------------
+# Layer 1 gains: Position PID [x, y, z, yaw]
+# Convert position error (metres) into a desired velocity setpoint (m/s).
+# -----------------------------------------------------------------------
+# Increase KP to fly toward the target faster and hold more tightly.
 # Too large → oscillation.
-KP = [0.7, 0.7, 0.9, 2.0]
+POS_KP = [1.2, 1.2, 1.4, 3.0]
+POS_KI = [0.12, 0.12, 0.15, 0.1]
+POS_KD = [0.2,  0.2,  0.2,  0.05]
 
-# --- Integral gains [x, y, z, yaw] ---
-# Corrects small steady-state offsets (e.g. from imperfect inner loop or wind).
-KI = [0.05, 0.05, 0.08, 0.05]
-
-# --- Derivative gains [x, y, z, yaw] ---
-KD = [0.2, 0.2, 0.3, 1.0]
+# -----------------------------------------------------------------------
+# Layer 2 gains: Velocity P [x, y, z]
+# Correct the error between desired and estimated actual velocity.
+# Yaw rate is already well-controlled by Layer 1 alone, so only x, y, z.
+#
+# NOTE: VEL_KI is intentionally set to zero.
+# Velocity is estimated from noisy position differences (Δpos/Δt).
+# Integrating that noisy signal causes the integral to drift (random walk)
+# until it hits the anti-windup limit, which then injects a spurious
+# constant offset into the velocity command and causes oscillation.
+# A pure P correction is enough to reduce velocity tracking error.
+# -----------------------------------------------------------------------
+VEL_KP = [0.1,  0.1,  0.1]
+VEL_KI = [0.0,  0.0,  0.0]
 
 # --- Speed limits (must match simulator's ±1 m/s / ±1.745 rad/s clip) ---
 VEL_MAX = 1.0    # m/s
@@ -33,125 +65,247 @@ YAW_MAX = 1.745  # rad/s
 
 # --- Anti-windup clamp ---
 # Prevents the integral from growing unboundedly if the drone is stuck.
-INTEG_MAX = 1.5  # m·s (or rad·s for yaw)
+POS_INTEG_MAX = 2.0   # max integral magnitude for position loop  (m·s)
+VEL_INTEG_MAX = 0.3   # max integral magnitude for velocity loop  (m·s)
 
-# --- Conditional integration distance ---
-# Only accumulate the x/y/z integral when within this distance of the target.
-# This stops "integral wind-up" during the long approach flight, which would
-# otherwise push the drone past the target and cause landing offset.
-CLOSE_DIST = 0.5  # metres
+# --- Filter coefficients for derivative and velocity estimation ---
+# Higher value = smoother but slightly slower response. Range: 0 → 1.
+DERIV_ALPHA = 0.85   # Position error derivative filter (heavy — avoids noisy D kicks)
+VEL_ALPHA   = 0.9    # Velocity estimation filter (very heavy — Δpos/Δt is inherently noisy)
 
-# Persistent state (survives between controller calls every dt seconds) 
+# -----------------------------------------------------------------------
+# Persistent state (survives between controller calls every dt seconds)
+# -----------------------------------------------------------------------
 
-# integral: Accumulate the error over time, which helps correct for any steady-state current_error in the system. 
-integral  = [0.0, 0.0, 0.0, 0.0]
-# last_target: Reset the integral whenever the target changes, preventing wind-up from previous targets
+# pos_integral: Accumulate the position error over time for the I term of Layer 1.
+# Helps correct for any steady-state offset in the system (e.g. constant wind).
+pos_integral = [0.0, 0.0, 0.0, 0.0]
+
+# vel_integral: Accumulate the velocity error over time for the I term of Layer 2.
+vel_integral = [0.0, 0.0, 0.0]
+
+# last_target: Reset the integrals whenever the target changes,
+# preventing wind-up from a previous target.
 last_target = None
-# last_error: Store the error from the previous time step for derivative calculation (if we were to implement a D term in the future). 
-# Currently unused since we are only implementing PI control, but can be useful for debugging or future extensions.
-last_error = [0.0, 0.0, 0.0, 0.0]  
+
+# last_pos: Store the previous position so we can estimate the drone's velocity
+# using the backward-difference formula: estimated_velocity = (Δpos / Δt).
+last_pos = None
+
+# last_pos_err: Store the previous position error for the D term.
+# Set to None on the first call so we can safely skip the D term on initialisation.
+last_pos_err = None
+
+# pos_d_filtered: Low-pass filtered derivative of the position error (reduces noise).
+pos_d_filtered = [0.0, 0.0, 0.0, 0.0]
+
+# est_vel: Estimated current velocity of the drone in the world frame (filtered).
+est_vel = [0.0, 0.0, 0.0]
+
 
 def controller(state, target_pos, dt, wind_enabled=False):
-    
-    # state 
-    # format: [position_x (m), position_y (m), position_z (m), roll (radians), pitch (radians), yaw (radians)]
-    # Meaning: Current GPS location and orientation of the drone in the world frame. The drone's "forward" direction is along its yaw angle.
 
-    # target_pos 
-    # format: (x (m), y (m), z (m), yaw (radians))
-    # Meaning: Desired position and yaw angle for the drone to reach. The drone should fly to this GPS location and orient itself to this yaw.
+    # state
+    # format: [position_x (m), position_y (m), position_z (m), roll (rad), pitch (rad), yaw (rad)]
+    # Meaning: Current GPS location and orientation of the drone in the world frame.
+    # The drone's "forward" direction is along its yaw angle.
+
+    # target_pos
+    # format: (x (m), y (m), z (m), yaw (rad))
+    # Meaning: Desired position and yaw angle for the drone to reach.
 
     # dt: time step (s)
-    # Meaning: It means brain rethinks current situation every dt seconds. Used for integrating the error over time in the I term.
+    # Meaning: The controller is called every dt seconds.  Used to integrate error over time.
 
-    # return velocity command format: (velocity_x_setpoint (m/s), velocity_y_setpoint (m/s), velocity_z_setpoint (m/s), yaw_rate_setpoint (radians/s))
+    # return velocity command format:
+    # (velocity_x_setpoint (m/s), velocity_y_setpoint (m/s),
+    #  velocity_z_setpoint (m/s), yaw_rate_setpoint (rad/s))
 
-    # Global variables to store the integral of the error for each axis and the last target position.
-    global integral, last_target, last_error
+    # Global variables to persist state between calls
+    global pos_integral, vel_integral, last_target, last_pos
+    global last_pos_err, pos_d_filtered, est_vel
 
-    # Unpack state and target
+    # Unpack current state and target
     x, y, z, _roll, _pitch, yaw = state
     tx, ty, tz, t_yaw = target_pos
+    safe_dt = max(dt, 1e-6)   # Avoid division by zero
 
-    # Reset integral whenever the target changes
+    # Reset all integrals and derivative state whenever the target changes.
+    # Without this, a sudden target jump would create a large one-frame derivative
+    # spike (the "derivative kick") that can jolt the drone violently.
     if last_target is not None and tuple(target_pos) != last_target:
-        integral = [0.0, 0.0, 0.0, 0.0]
+        pos_integral    = [0.0, 0.0, 0.0, 0.0]
+        vel_integral    = [0.0, 0.0, 0.0]
+        pos_d_filtered  = [0.0, 0.0, 0.0, 0.0]
+        est_vel         = [0.0, 0.0, 0.0]
+        last_pos_err    = None   # Force skip of D term on the very next call
     last_target = tuple(target_pos)
 
+    # =======================================================================
+    # LAYER 1: Position PID
+    # Compute position error and calculate the desired velocity setpoint.
+    # =======================================================================
+
     # ------------------------------------------------------------------
-    # Step 1 — Position current_error in the World Frame
+    # Step 1 — Position error in the World Frame
     # ------------------------------------------------------------------
-    
-    # Compute the difference between the target and current position
-    ex = tx - x
-    ey = ty - y
-    ez = tz - z
+    ex    = tx - x
+    ey    = ty - y
+    ez    = tz - z
     # Wrap yaw error to [-π, π] so the drone always turns the short way
     e_yaw = (t_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
 
-    current_error = [ex, ey, ez, e_yaw]
+    pos_err = [ex, ey, ez, e_yaw]
 
     # ------------------------------------------------------------------
-    # Step 2 — Update the integrals (with anti-windup clamp)
+    # Step 2 — Update the position integrals (per-axis saturation anti-windup)
     #
-    # For x/y/z: only integrate when close to the target.
-    #   Reason: if we integrate during the full 3 m approach, the integral
-    #   winds up a large value that overshoots the landing point.
-    # For yaw: always integrate (yaw has no "distance" to worry about).
+    # Each axis integrates independently only when its own P term is unsaturated.
+    # During a long-distance approach the P term hits the velocity limit, so
+    # accumulating the integral would cause overshoot on arrival.
+    # Once close enough (P term below VEL_MAX), the integral builds and
+    # eliminates any residual steady-state error (e.g. caused by wind).
+    #
+    # Using per-axis checks (not a combined OR) so that, for example, altitude
+    # can still integrate even while the drone is far away horizontally.
+    # Yaw always integrates because it has no velocity-saturation issue.
     # ------------------------------------------------------------------
-    safe_dt     = max(dt, 1e-6)
-    dist_to_tgt = math.sqrt(ex**2 + ey**2 + ez**2)
+    # x axis: integrate only when the x P-output would not saturate
+    if abs(POS_KP[0] * ex) < VEL_MAX:
+        pos_integral[0] += pos_err[0] * safe_dt
+        pos_integral[0]  = max(-POS_INTEG_MAX, min(POS_INTEG_MAX, pos_integral[0]))
 
-    for i in range(4):
-        if i == 3 or dist_to_tgt < CLOSE_DIST:          # yaw, or close to target
-            integral[i] += current_error[i] * safe_dt
-            integral[i]  = max(-INTEG_MAX, min(INTEG_MAX, integral[i]))
+    # y axis
+    if abs(POS_KP[1] * ey) < VEL_MAX:
+        pos_integral[1] += pos_err[1] * safe_dt
+        pos_integral[1]  = max(-POS_INTEG_MAX, min(POS_INTEG_MAX, pos_integral[1]))
+
+    # z axis
+    if abs(POS_KP[2] * ez) < VEL_MAX:
+        pos_integral[2] += pos_err[2] * safe_dt
+        pos_integral[2]  = max(-POS_INTEG_MAX, min(POS_INTEG_MAX, pos_integral[2]))
+
+    # Yaw integral — always active
+    pos_integral[3] += pos_err[3] * safe_dt
+    pos_integral[3]  = max(-POS_INTEG_MAX, min(POS_INTEG_MAX, pos_integral[3]))
 
     # ------------------------------------------------------------------
-    # Step 3 — PI control → world-frame velocity commands
+    # Step 3 — Compute filtered derivative of the position error
+    #
+    # D term reacts to the rate of change of the error, damping oscillations.
+    # On the very first call there is no previous error, so we skip D.
+    # The low-pass filter (DERIV_ALPHA) smooths sensor noise in the derivative.
     # ------------------------------------------------------------------
-    
-    # Compute the desired velocity in the world frame using the proportional, integral, and derivative terms of the PID controller. 
+    if last_pos_err is None:
+        # First call: no previous error available — initialise derivative to zero
+        pos_d_filtered = [0.0, 0.0, 0.0, 0.0]
+    else:
+        for i in range(4):
+            raw_d = (pos_err[i] - last_pos_err[i]) / safe_dt
+            # Exponential moving-average filter: mix old and new derivative values
+            pos_d_filtered[i] = (DERIV_ALPHA * pos_d_filtered[i] +
+                                 (1.0 - DERIV_ALPHA) * raw_d)
+
+    # Save the current position error ready for the next call's D calculation
+    last_pos_err = pos_err[:]
+
+    # ------------------------------------------------------------------
+    # Step 4 — PID calculation → desired velocity in the world frame
+    #
+    # Compute the desired velocity in the world frame using the proportional,
+    # integral, and derivative terms of the PID controller.
     # P term reacts to the current error
-    # I term corrects for any accumulated error over time 
+    # I term corrects for any accumulated error over time
     # D term reacts to the rate of change of the error
-    vx = KP[0] * ex + KI[0] * integral[0] + KD[0] * ((current_error[0] - last_error[0]) / safe_dt)
-    vy = KP[1] * ey + KI[1] * integral[1] + KD[1] * ((current_error[1] - last_error[1]) / safe_dt)
-    vz = KP[2] * ez + KI[2] * integral[2] + KD[2] * ((current_error[2] - last_error[2]) / safe_dt)
-    yaw_rate = KP[3] * e_yaw + KI[3] * integral[3] + KD[3] * ((current_error[3] - last_error[3]) / safe_dt)
+    # ------------------------------------------------------------------
+    vx_des   = (POS_KP[0] * ex    + POS_KI[0] * pos_integral[0]
+                                   + POS_KD[0] * pos_d_filtered[0])
+    vy_des   = (POS_KP[1] * ey    + POS_KI[1] * pos_integral[1]
+                                   + POS_KD[1] * pos_d_filtered[1])
+    vz_des   = (POS_KP[2] * ez    + POS_KI[2] * pos_integral[2]
+                                   + POS_KD[2] * pos_d_filtered[2])
+    yaw_rate = (POS_KP[3] * e_yaw + POS_KI[3] * pos_integral[3]
+                                   + POS_KD[3] * pos_d_filtered[3])
 
     # ------------------------------------------------------------------
-    # Step 4 — Clamp to simulator speed limits
+    # Step 5 — Clamp desired velocity to simulator speed limits
     # ------------------------------------------------------------------
-    vx = max(-VEL_MAX, min(VEL_MAX, vx))
-    vy = max(-VEL_MAX, min(VEL_MAX, vy))
-    vz = max(-VEL_MAX, min(VEL_MAX, vz))
+    vx_des   = max(-VEL_MAX, min(VEL_MAX, vx_des))
+    vy_des   = max(-VEL_MAX, min(VEL_MAX, vy_des))
+    vz_des   = max(-VEL_MAX, min(VEL_MAX, vz_des))
     yaw_rate = max(-YAW_MAX, min(YAW_MAX, yaw_rate))
 
-    # ------------------------------------------------------------------
-    # Step 5 — Rotate world-frame xy velocity into the drone's body frame
+    # =======================================================================
+    # LAYER 2: Velocity PI (cascade refinement)
+    #
+    # Estimate the drone's actual velocity from the change in position, then
+    # correct the velocity command based on the velocity tracking error.
+    # This middle loop improves accuracy by ensuring the velocity setpoint
+    # from Layer 1 is actually being achieved by the drone.
+    # =======================================================================
+
+    # Estimate current velocity using the backward difference method (Δpos / Δt)
+    if last_pos is not None:
+        raw_vx_est = (x - last_pos[0]) / safe_dt
+        raw_vy_est = (y - last_pos[1]) / safe_dt
+        raw_vz_est = (z - last_pos[2]) / safe_dt
+        # Apply a very heavy low-pass filter (VEL_ALPHA=0.9) to smooth the noisy
+        # velocity estimate.  Δpos/Δt at 20 Hz amplifies even tiny position noise.
+        est_vel[0] = VEL_ALPHA * est_vel[0] + (1.0 - VEL_ALPHA) * raw_vx_est
+        est_vel[1] = VEL_ALPHA * est_vel[1] + (1.0 - VEL_ALPHA) * raw_vy_est
+        est_vel[2] = VEL_ALPHA * est_vel[2] + (1.0 - VEL_ALPHA) * raw_vz_est
+
+    # Save the current position so the next call can estimate velocity
+    last_pos = [x, y, z]
+
+    # Velocity error: how far the estimated actual velocity is from the desired
+    vel_err_x = vx_des - est_vel[0]
+    vel_err_y = vy_des - est_vel[1]
+    vel_err_z = vz_des - est_vel[2]
+
+    # Update velocity integrals with anti-windup clamp
+    vel_integral[0] += vel_err_x * safe_dt
+    vel_integral[1] += vel_err_y * safe_dt
+    vel_integral[2] += vel_err_z * safe_dt
+    for i in range(3):
+        vel_integral[i] = max(-VEL_INTEG_MAX, min(VEL_INTEG_MAX, vel_integral[i]))
+
+    # PI output: velocity correction added on top of the Layer 1 setpoint
+    vx_corr = VEL_KP[0] * vel_err_x + VEL_KI[0] * vel_integral[0]
+    vy_corr = VEL_KP[1] * vel_err_y + VEL_KI[1] * vel_integral[1]
+    vz_corr = VEL_KP[2] * vel_err_z + VEL_KI[2] * vel_integral[2]
+
+    # Combine Layer 1 setpoint and Layer 2 correction, then clamp to limits
+    vx = max(-VEL_MAX, min(VEL_MAX, vx_des + vx_corr))
+    vy = max(-VEL_MAX, min(VEL_MAX, vy_des + vy_corr))
+    vz = max(-VEL_MAX, min(VEL_MAX, vz_des + vz_corr))
+
+    # =======================================================================
+    # Step 6 — Rotate world-frame xy velocity into the drone's body frame
     #
     # The inner loop (tello_controller.py) receives velocities relative
     # to the drone's heading (yaw), not the world axes.
     # We apply the inverse-yaw rotation to convert:
     #   vx_body =  vx·cos(yaw) + vy·sin(yaw)
     #   vy_body = -vx·sin(yaw) + vy·cos(yaw)
-    # ------------------------------------------------------------------
-    c, s    = math.cos(yaw), math.sin(yaw)
+    # =======================================================================
+    c = math.cos(yaw)
+    s = math.sin(yaw)
 
     # vx_body
-    # How fast to move forward/backward relative to the drone's current facing direction. Positive vx_body means move forward, negative means move backward.
+    # How fast to move forward/backward relative to the drone's current facing direction.
+    # Positive vx_body means move forward, negative means move backward.
     vx_body =  vx * c + vy * s
 
     # vy_body
-    # How fast to move left/right relative to the drone's current facing direction. Positive vy_body means move to the right, negative means move to the left.
+    # How fast to move left/right relative to the drone's current facing direction.
+    # Positive vy_body means move to the right, negative means move to the left.
     vy_body = -vx * s + vy * c
 
-    # vz is already in the body frame (up/down), and yaw_rate is unaffected by rotation, so we keep them as is.
-    # yaw_rate is how fast to rotate around the vertical axis. Positive yaw_rate means rotate clockwise, negative means rotate counterclockwise.
+    # vz is already in the body frame (up/down), and yaw_rate is unaffected by rotation,
+    # so we keep them as is.
+    # yaw_rate is how fast to rotate around the vertical axis.
+    # Positive yaw_rate means rotate clockwise, negative means rotate counterclockwise.
     output = (vx_body, vy_body, vz, yaw_rate)
-
-    # Store the current error for potential future use (e.g., if we were to implement a D term)
-    last_error = current_error  
 
     return output
