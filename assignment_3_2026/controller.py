@@ -50,9 +50,9 @@ import math
 # I — slow correction for residual offset (wind primarily handled by DOBC)
 # D — damp oscillations; operates on a filtered derivative to reduce noise
 # -----------------------------------------------------------------------
-POS_KP = [1.0,  1.0,  1.3,  2.2 ]
+POS_KP = [1.14,  1.14,  1.3,  2.2 ]
 POS_KI = [0.0,  0.0,  0.10, 0.07]
-POS_KD = [0.55, 0.55, 0.38, 0.10]
+POS_KD = [0.54, 0.54, 0.38, 0.10]
 
 # -----------------------------------------------------------------------
 # Speed limits (must match the simulator's internal clip values)
