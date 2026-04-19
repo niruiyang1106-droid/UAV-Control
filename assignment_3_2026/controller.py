@@ -1,4 +1,4 @@
-wind_enabled = True   # Set True → simulator applies wind disturbances during marking
+#wind_enabled = True   # Set True → simulator applies wind disturbances during marking
 
 import math
 
@@ -40,7 +40,7 @@ import math
 # -----------------------------------------------------------------------
 # Increase KP to fly toward the target faster and hold more tightly.
 # Too large → oscillation.
-POS_KP = [1.2, 1.2, 1.4, 3.0]
+POS_KP = [0.85, 0.85, 1.4, 3.0]
 POS_KI = [0.12, 0.12, 0.15, 0.1]
 POS_KD = [0.2,  0.2,  0.2,  0.05]
 
@@ -70,8 +70,8 @@ VEL_INTEG_MAX = 0.3   # max integral magnitude for velocity loop  (m·s)
 
 # --- Filter coefficients for derivative and velocity estimation ---
 # Higher value = smoother but slightly slower response. Range: 0 → 1.
-DERIV_ALPHA = 0.85   # Position error derivative filter (heavy — avoids noisy D kicks)
-VEL_ALPHA   = 0.9    # Velocity estimation filter (very heavy — Δpos/Δt is inherently noisy)
+DERIV_ALPHA = 0.5   # Position error derivative filter (heavy — avoids noisy D kicks)
+VEL_ALPHA   = 0.5    # Velocity estimation filter (very heavy — Δpos/Δt is inherently noisy)
 
 # -----------------------------------------------------------------------
 # Persistent state (survives between controller calls every dt seconds)
