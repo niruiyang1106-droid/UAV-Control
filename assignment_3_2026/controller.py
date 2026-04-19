@@ -44,10 +44,19 @@ _last_target = None
 
 
 def controller(state, target_pos, dt, wind_enabled=False):
-    # state:      [x, y, z, roll, pitch, yaw]  world frame (m / rad)
-    # target_pos: (x, y, z, yaw)
-    # dt:         control timestep (s)
-    # returns:    (vx, vy, vz, yaw_rate) in drone yaw-body frame
+    
+    # state 
+    # format: [position_x (m), position_y (m), position_z (m), roll (radians), pitch (radians), yaw (radians)]
+    # Meaning: GPS location and orientation of the drone in the world frame. The drone's "forward" direction is along its yaw angle.
+
+    # target_pos 
+    # format: (x (m), y (m), z (m), yaw (radians))
+    # Meaning: Desired position and yaw angle for the drone to reach. The drone should fly to this GPS location and orient itself to this yaw.
+
+    # dt: time step (s)
+    # Meaning: It means brain rethinks current situation every dt seconds. Used for integrating the error over time in the I term.
+
+    # eturn velocity command format: (velocity_x_setpoint (m/s), velocity_y_setpoint (m/s), velocity_z_setpoint (m/s), yaw_rate_setpoint (radians/s))
 
     global _integral, _last_target
 
@@ -92,7 +101,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # ------------------------------------------------------------------
     vx       = KP[0] * ex    + KI[0] * _integral[0]
     vy       = KP[1] * ey    + KI[1] * _integral[1]
-    vz       = KP[2] * ez    + KI[2] * _integral[2]
+    vz       = KP[2] * ez    + KI[2] * _integral[2] 
     yaw_rate = KP[3] * e_yaw + KI[3] * _integral[3]
 
     # ------------------------------------------------------------------
@@ -113,7 +122,17 @@ def controller(state, target_pos, dt, wind_enabled=False):
     #   vy_body = -vx·sin(yaw) + vy·cos(yaw)
     # ------------------------------------------------------------------
     c, s    = math.cos(yaw), math.sin(yaw)
+
+    # vx_body
+    # How fast to move forward/backward relative to the drone's current facing direction. Positive vx_body means move forward, negative means move backward.
     vx_body =  vx * c + vy * s
+
+    # vy_body
+    # How fast to move left/right relative to the drone's current facing direction. Positive vy_body means move to the right, negative means move to the left.
     vy_body = -vx * s + vy * c
 
-    return (vx_body, vy_body, vz, yaw_rate)
+    # vz is already in the body frame (up/down), and yaw_rate is unaffected by rotation, so we keep them as is.
+    # yaw_rate is how fast to rotate around the vertical axis. Positive yaw_rate means rotate clockwise, negative means rotate counterclockwise.
+    output = (vx_body, vy_body, vz, yaw_rate)
+
+    return output

@@ -101,7 +101,7 @@ class Simulator:
     def load_targets(self):
         targets = []
         try:
-            with open("/home/student52/Desktop/AERO60492/CW3/assignment_3_2026/assignment_3_2026/src/targets.csv", "r") as file:
+            with open("/home/student52/Desktop/AERO60492/CW3/assignment_3_2026/assignment_3_2026/targets.csv", "r") as file:
                 csvreader = csv.reader(file)
                 header = next(csvreader)
                 for row in csvreader:
@@ -113,7 +113,7 @@ class Simulator:
         except FileNotFoundError:
             pass
         if not targets:
-            targets.append((-2, 2, 2, 1.57))
+            targets.append((0.0, 0.0, 0.0, 0.0))
         return targets
 
     def compute_dynamics(self, rpm_values, lin_vel_world, quat):
