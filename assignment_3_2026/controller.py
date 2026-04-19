@@ -24,6 +24,9 @@ KP = [0.7, 0.7, 0.9, 2.0]
 # Corrects small steady-state offsets (e.g. from imperfect inner loop or wind).
 KI = [0.05, 0.05, 0.08, 0.05]
 
+# --- Derivative gains [x, y, z, yaw] ---
+KD = [0.2, 0.2, 0.3, 1.0]
+
 # --- Speed limits (must match simulator's ±1 m/s / ±1.745 rad/s clip) ---
 VEL_MAX = 1.0    # m/s
 YAW_MAX = 1.745  # rad/s
@@ -38,16 +41,21 @@ INTEG_MAX = 1.5  # m·s (or rad·s for yaw)
 # otherwise push the drone past the target and cause landing offset.
 CLOSE_DIST = 0.5  # metres
 
-# --- Persistent state (survives between controller calls) ---
-_integral    = [0.0, 0.0, 0.0, 0.0]
-_last_target = None
+# Persistent state (survives between controller calls every dt seconds) 
 
+# integral: Accumulate the error over time, which helps correct for any steady-state current_error in the system. 
+integral  = [0.0, 0.0, 0.0, 0.0]
+# last_target: Reset the integral whenever the target changes, preventing wind-up from previous targets
+last_target = None
+# last_error: Store the error from the previous time step for derivative calculation (if we were to implement a D term in the future). 
+# Currently unused since we are only implementing PI control, but can be useful for debugging or future extensions.
+last_error = [0.0, 0.0, 0.0, 0.0]  
 
 def controller(state, target_pos, dt, wind_enabled=False):
     
     # state 
     # format: [position_x (m), position_y (m), position_z (m), roll (radians), pitch (radians), yaw (radians)]
-    # Meaning: GPS location and orientation of the drone in the world frame. The drone's "forward" direction is along its yaw angle.
+    # Meaning: Current GPS location and orientation of the drone in the world frame. The drone's "forward" direction is along its yaw angle.
 
     # target_pos 
     # format: (x (m), y (m), z (m), yaw (radians))
@@ -56,29 +64,32 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # dt: time step (s)
     # Meaning: It means brain rethinks current situation every dt seconds. Used for integrating the error over time in the I term.
 
-    # eturn velocity command format: (velocity_x_setpoint (m/s), velocity_y_setpoint (m/s), velocity_z_setpoint (m/s), yaw_rate_setpoint (radians/s))
+    # return velocity command format: (velocity_x_setpoint (m/s), velocity_y_setpoint (m/s), velocity_z_setpoint (m/s), yaw_rate_setpoint (radians/s))
 
-    global _integral, _last_target
+    # Global variables to store the integral of the error for each axis and the last target position.
+    global integral, last_target, last_error
 
     # Unpack state and target
     x, y, z, _roll, _pitch, yaw = state
     tx, ty, tz, t_yaw = target_pos
 
     # Reset integral whenever the target changes
-    if _last_target is not None and tuple(target_pos) != _last_target:
-        _integral = [0.0, 0.0, 0.0, 0.0]
-    _last_target = tuple(target_pos)
+    if last_target is not None and tuple(target_pos) != last_target:
+        integral = [0.0, 0.0, 0.0, 0.0]
+    last_target = tuple(target_pos)
 
     # ------------------------------------------------------------------
-    # Step 1 — Position errors in the world frame
+    # Step 1 — Position current_error in the World Frame
     # ------------------------------------------------------------------
-    ex    = tx - x
-    ey    = ty - y
-    ez    = tz - z
+    
+    # Compute the difference between the target and current position
+    ex = tx - x
+    ey = ty - y
+    ez = tz - z
     # Wrap yaw error to [-π, π] so the drone always turns the short way
     e_yaw = (t_yaw - yaw + math.pi) % (2 * math.pi) - math.pi
 
-    errors = [ex, ey, ez, e_yaw]
+    current_error = [ex, ey, ez, e_yaw]
 
     # ------------------------------------------------------------------
     # Step 2 — Update the integrals (with anti-windup clamp)
@@ -93,23 +104,28 @@ def controller(state, target_pos, dt, wind_enabled=False):
 
     for i in range(4):
         if i == 3 or dist_to_tgt < CLOSE_DIST:          # yaw, or close to target
-            _integral[i] += errors[i] * safe_dt
-            _integral[i]  = max(-INTEG_MAX, min(INTEG_MAX, _integral[i]))
+            integral[i] += current_error[i] * safe_dt
+            integral[i]  = max(-INTEG_MAX, min(INTEG_MAX, integral[i]))
 
     # ------------------------------------------------------------------
     # Step 3 — PI control → world-frame velocity commands
     # ------------------------------------------------------------------
-    vx       = KP[0] * ex    + KI[0] * _integral[0]
-    vy       = KP[1] * ey    + KI[1] * _integral[1]
-    vz       = KP[2] * ez    + KI[2] * _integral[2] 
-    yaw_rate = KP[3] * e_yaw + KI[3] * _integral[3]
+    
+    # Compute the desired velocity in the world frame using the proportional, integral, and derivative terms of the PID controller. 
+    # P term reacts to the current error
+    # I term corrects for any accumulated error over time 
+    # D term reacts to the rate of change of the error
+    vx = KP[0] * ex + KI[0] * integral[0] + KD[0] * ((current_error[0] - last_error[0]) / safe_dt)
+    vy = KP[1] * ey + KI[1] * integral[1] + KD[1] * ((current_error[1] - last_error[1]) / safe_dt)
+    vz = KP[2] * ez + KI[2] * integral[2] + KD[2] * ((current_error[2] - last_error[2]) / safe_dt)
+    yaw_rate = KP[3] * e_yaw + KI[3] * integral[3] + KD[3] * ((current_error[3] - last_error[3]) / safe_dt)
 
     # ------------------------------------------------------------------
     # Step 4 — Clamp to simulator speed limits
     # ------------------------------------------------------------------
-    vx       = max(-VEL_MAX, min(VEL_MAX, vx))
-    vy       = max(-VEL_MAX, min(VEL_MAX, vy))
-    vz       = max(-VEL_MAX, min(VEL_MAX, vz))
+    vx = max(-VEL_MAX, min(VEL_MAX, vx))
+    vy = max(-VEL_MAX, min(VEL_MAX, vy))
+    vz = max(-VEL_MAX, min(VEL_MAX, vz))
     yaw_rate = max(-YAW_MAX, min(YAW_MAX, yaw_rate))
 
     # ------------------------------------------------------------------
@@ -134,5 +150,8 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # vz is already in the body frame (up/down), and yaw_rate is unaffected by rotation, so we keep them as is.
     # yaw_rate is how fast to rotate around the vertical axis. Positive yaw_rate means rotate clockwise, negative means rotate counterclockwise.
     output = (vx_body, vy_body, vz, yaw_rate)
+
+    # Store the current error for potential future use (e.g., if we were to implement a D term)
+    last_error = current_error  
 
     return output
