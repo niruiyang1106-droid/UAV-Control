@@ -50,9 +50,9 @@ import math
 # I — slow correction for residual offset (wind primarily handled by DOBC)
 # D — damp oscillations; operates on a filtered derivative to reduce noise
 # -----------------------------------------------------------------------
-POS_KP = [1.14,  1.14,  1.3,  2.2 ]
-POS_KI = [0.0,  0.0,  0.10, 0.07]
-POS_KD = [0.54, 0.54, 0.38, 0.10]
+KP = [1.2,  1.2,  1.5,  2.3 ]
+KI = [0.0,  0.0,  0.10, 0.07]
+KD = [0.4, 0.4, 0.38, 0.10]
 
 # -----------------------------------------------------------------------
 # Speed limits (must match the simulator's internal clip values)
@@ -89,7 +89,7 @@ DOBC_ALPHA = 0.98
 # DOBC_GAIN: how much of the wind estimate to subtract.
 #   0.8 < 1.0 adds a small safety margin against velocity-estimate noise
 #   near the setpoint where last_cmd ≈ 0 and disturbance calc is noisiest.
-DOBC_GAIN = 0.5
+DOBC_GAIN = 0.4
 
 # DOBC_MAX: hard cap on the wind compensation magnitude (m/s per axis).
 #   Prevents a corrupted wind_est from overwhelming the PID command.
@@ -108,8 +108,8 @@ VEL_EST_ALPHA = 0.7
 # The D term handles small residual damping; braking handles large-scale
 # overshoot from the transient approach phase.
 # -----------------------------------------------------------------------
-BRAKE_RADIUS   = 0.5   # metres — start tapering max speed inside this radius
-BRAKE_MIN_FRAC = 0.20  # floor: 20% of VEL_MAX even at zero distance
+BRAKE_RADIUS   = 0.3   # metres — start tapering max speed inside this radius
+BRAKE_MIN_FRAC = 0.4  # floor: 20% of VEL_MAX even at zero distance
 
 # -----------------------------------------------------------------------
 # Persistent state — survives across controller calls
@@ -167,10 +167,13 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # ===================================================================
     # STEP 1 — Position error in the World Frame
     # ===================================================================
-    ex    = tx - x
-    ey    = ty - y
-    ez    = tz - z
+    
+    # Error = target − current
+    ex = tx - x
+    ey = ty - y
+    ez = tz - z
     # Wrap yaw error to (−π, π] so the drone always turns the short way
+    # Angle Wrapping makes drone turn the short way: e.g. if t_yaw = +179° and yaw = -179°, the error is +2°, not -358°
     e_yaw = (t_yaw - yaw + math.pi) % (2.0 * math.pi) - math.pi
 
     pos_err = [ex, ey, ez, e_yaw]
@@ -188,13 +191,11 @@ def controller(state, target_pos, dt, wind_enabled=False):
     if dist_3d < INTEG_DIST_THRESH:
         for i in range(3):                   # x, y, z
             pos_integral[i] += pos_err[i] * safe_dt
-            pos_integral[i]  = max(-POS_INTEG_MAX,
-                                    min(POS_INTEG_MAX, pos_integral[i]))
+            pos_integral[i]  = max(-POS_INTEG_MAX, min(POS_INTEG_MAX, pos_integral[i]))
 
     if abs(e_yaw) < INTEG_YAW_THRESH:       # yaw
         pos_integral[3] += pos_err[3] * safe_dt
-        pos_integral[3]  = max(-POS_INTEG_MAX,
-                                min(POS_INTEG_MAX, pos_integral[3]))
+        pos_integral[3]  = max(-POS_INTEG_MAX,  min(POS_INTEG_MAX, pos_integral[3]))
 
     # ===================================================================
     # STEP 3 — Filtered Derivative of Position Error
@@ -209,31 +210,22 @@ def controller(state, target_pos, dt, wind_enabled=False):
         for i in range(4):
             raw_d = (pos_err[i] - last_pos_err[i]) / safe_dt
             # EMA: blend previous filtered value with new raw derivative
-            pos_d_filtered[i] = (DERIV_ALPHA * pos_d_filtered[i]
-                                 + (1.0 - DERIV_ALPHA) * raw_d)
+            pos_d_filtered[i] = (DERIV_ALPHA * pos_d_filtered[i] + (1.0 - DERIV_ALPHA) * raw_d)
 
     last_pos_err = pos_err[:]   # Save for next call
 
     # ===================================================================
     # STEP 4 — Single-Loop Position PID → desired velocity (World Frame)
     #
-    #   v_cmd = Kp · e  +  Ki · ∫e dt  +  Kd · ė_filtered
+    # v_cmd = Kp · e  +  Ki · ∫e dt  +  Kd · ė_filtered
     # ===================================================================
-    vx_pid = (POS_KP[0] * ex
-              + POS_KI[0] * pos_integral[0]
-              + POS_KD[0] * pos_d_filtered[0])
+    vx_pid = (KP[0] * ex + KI[0] * pos_integral[0] + KD[0] * pos_d_filtered[0])
 
-    vy_pid = (POS_KP[1] * ey
-              + POS_KI[1] * pos_integral[1]
-              + POS_KD[1] * pos_d_filtered[1])
+    vy_pid = (KP[1] * ey + KI[1] * pos_integral[1] + KD[1] * pos_d_filtered[1])
 
-    vz_pid = (POS_KP[2] * ez
-              + POS_KI[2] * pos_integral[2]
-              + POS_KD[2] * pos_d_filtered[2])
+    vz_pid = (KP[2] * ez + KI[2] * pos_integral[2] + KD[2] * pos_d_filtered[2])
 
-    yaw_rate_pid = (POS_KP[3] * e_yaw
-                    + POS_KI[3] * pos_integral[3]
-                    + POS_KD[3] * pos_d_filtered[3])
+    yaw_rate_pid = (KP[3] * e_yaw + KI[3] * pos_integral[3] + KD[3] * pos_d_filtered[3])
 
     # Proximity braking: reduce the velocity ceiling as the drone nears the
     # setpoint.  This prevents a fast approach from overshooting and then
@@ -334,4 +326,6 @@ def controller(state, target_pos, dt, wind_enabled=False):
     vx_body =  vx_final * c + vy_final * s
     vy_body = -vx_final * s + vy_final * c
 
-    return (vx_body, vy_body, vz_final, yaw_rate_final)
+    output = (vx_body, vy_body, vz_final, yaw_rate_final)
+
+    return output
