@@ -16,7 +16,7 @@ import math
 #   │  DOBC:             ▼                                         │
 #   │  vel_est ─► disturbance ─► [EMA filter] ─► wind_est          │
 #   │                                                  │           │
-#   │  vx_final = vx_pid − wind_est_x  ◄──────────────┘            │
+#   │  vx_final = vx_pid − wind_est_x   ◄──────────────┘           │
 #   │  vy_final = vy_pid − wind_est_y                              │
 #   │                    │                                         │
 #   │  [Yaw rotation] ──► vx_body, vy_body (Body Frame)  ──► UAV   │
@@ -114,17 +114,20 @@ BRAKE_MIN_FRAC = 0.4  # floor: 20% of VEL_MAX even at zero distance
 # -----------------------------------------------------------------------
 # Persistent state — survives across controller calls
 # -----------------------------------------------------------------------
-pos_integral   = [0.0, 0.0, 0.0, 0.0]  # Accumulated position error [x,y,z,yaw]
+header_written = False                   # Ensure we write the CSV header only once
+pos_integral   = [0.0, 0.0, 0.0, 0.0]    # Accumulated position error [x,y,z,yaw]
 last_target    = None                    # Detect target changes → reset integrals
 last_pos       = None                    # Previous position for Δpos/Δt
 last_pos_err   = None                    # Previous pos error for D term
-pos_d_filtered = [0.0, 0.0, 0.0, 0.0]  # Low-pass filtered derivative
+pos_d_filtered = [0.0, 0.0, 0.0, 0.0]    # Low-pass filtered derivative
 
 # DOBC state (world frame, x and y only)
 vel_est  = [0.0, 0.0]   # Smoothed velocity estimate  [vx, vy]
 wind_est = [0.0, 0.0]   # Smoothed wind disturbance   [wx, wy]
 last_cmd = [0.0, 0.0]   # Last world-frame PID command [vx, vy]
 
+# Simulation and Experiement time tracking
+sim_time = 0.0   # Seconds — cumulative time since start of Simulation (for logging)
 
 def controller(state, target_pos, dt, wind_enabled=False):
     """
@@ -142,14 +145,18 @@ def controller(state, target_pos, dt, wind_enabled=False):
     (vx_body, vy_body, vz, yaw_rate) — velocity commands in body frame (m/s, rad/s)
     """
 
-    global pos_integral, last_target, last_pos
+    global header_written, pos_integral, last_target, last_pos
     global last_pos_err, pos_d_filtered
     global vel_est, wind_est, last_cmd
+    global sim_time
 
     # Unpack state and target
     x, y, z, _roll, _pitch, yaw = state
     tx, ty, tz, t_yaw = target_pos
+
+    # Simulation time tracking
     safe_dt = max(dt, 1e-6)   # Guard against dt = 0 at startup
+    sim_time += safe_dt       # Update cumulative simulation time
 
     # -------------------------------------------------------------------
     # Housekeeping: reset integral / derivative state on target change.
@@ -163,6 +170,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
         pos_d_filtered = [0.0, 0.0, 0.0, 0.0]
         last_pos_err   = None   # Skip D term on the very next call
     last_target = tuple(target_pos)
+
 
     # ===================================================================
     # STEP 1 — Position error in the World Frame
@@ -178,6 +186,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
 
     pos_err = [ex, ey, ez, e_yaw]
 
+
     # ===================================================================
     # STEP 2 — Conditional Integration (Anti-windup)
     #
@@ -186,6 +195,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # on top of a saturated P term causes overshoot.
     # x/y/z share a 3-D distance gate; yaw has a separate angular gate.
     # ===================================================================
+    
     dist_3d = math.sqrt(ex*ex + ey*ey + ez*ez)
 
     if dist_3d < INTEG_DIST_THRESH:
@@ -197,6 +207,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
         pos_integral[3] += pos_err[3] * safe_dt
         pos_integral[3]  = max(-POS_INTEG_MAX,  min(POS_INTEG_MAX, pos_integral[3]))
 
+
     # ===================================================================
     # STEP 3 — Filtered Derivative of Position Error
     #
@@ -204,6 +215,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
     # shrinking.  The raw finite difference is noisy, so we apply an EMA.
     # On the first call last_pos_err is None — we skip D to avoid a spike.
     # ===================================================================
+
     if last_pos_err is None:
         pos_d_filtered = [0.0, 0.0, 0.0, 0.0]
     else:
@@ -214,11 +226,13 @@ def controller(state, target_pos, dt, wind_enabled=False):
 
     last_pos_err = pos_err[:]   # Save for next call
 
+
     # ===================================================================
     # STEP 4 — Single-Loop Position PID → desired velocity (World Frame)
     #
     # v_cmd = Kp · e  +  Ki · ∫e dt  +  Kd · ė_filtered
     # ===================================================================
+
     vx_pid = (KP[0] * ex + KI[0] * pos_integral[0] + KD[0] * pos_d_filtered[0])
 
     vy_pid = (KP[1] * ey + KI[1] * pos_integral[1] + KD[1] * pos_d_filtered[1])
@@ -242,6 +256,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
     vz_pid       = max(-v_lim,    min(v_lim,    vz_pid))
     yaw_rate_pid = max(-YAW_MAX,  min(YAW_MAX,  yaw_rate_pid))
 
+
     # ===================================================================
     # STEP 5 — DOBC: Disturbance Observer-Based Feedforward Compensation
     #          (X and Y world-frame axes only; wind assumed horizontal)
@@ -258,6 +273,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
     #   d) Heavy EMA (DOBC_ALPHA = 0.98) keeps only the DC/steady component
     #   e) Feedforward: subtract wind estimate from PID output
     # ===================================================================
+    
     if last_pos is not None:
         # (a) Velocity differentiation in the world frame
         raw_vx_est = (x - last_pos[0]) / safe_dt
@@ -308,6 +324,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
     last_cmd[0] = vx_final
     last_cmd[1] = vy_final
 
+
     # ===================================================================
     # STEP 6 — World Frame → Body Frame rotation
     #
@@ -320,6 +337,7 @@ def controller(state, target_pos, dt, wind_enabled=False):
     #
     # vz and yaw_rate are invariant under this rotation (vertical axis).
     # ===================================================================
+    
     c = math.cos(yaw)
     s = math.sin(yaw)
 
@@ -327,5 +345,28 @@ def controller(state, target_pos, dt, wind_enabled=False):
     vy_body = -vx_final * s + vy_final * c
 
     output = (vx_body, vy_body, vz_final, yaw_rate_final)
+
+
+    # ===================================================================
+    # STEP 7 — Simulation Data Collection
+    # ===================================================================
+
+    if 10.0 <= sim_time <= 20.0:  # Collect data between 10s and 20s
+        log_data = [sim_time] + list(state) + list(target_pos) + list(output) + wind_est
+        log_string = ','.join(map(lambda val: f"{val:.4f}", log_data)) + '\n'
+
+        try:
+            if not header_written:
+                with open('simulation_data.csv', 'w') as f:
+                    header = "sim_time, x, y, z, roll, pitch, yaw, tx, ty, tz, t_yaw, vx_body, vy_body, vz, yaw_rate, wind_est_x, wind_est_y\n"
+                    f.write(header)
+                    f.write(log_string)
+                header_written = True
+            else:
+                with open('simulation_data.csv', 'a') as f:
+                    f.write(log_string)
+        except Exception as e:
+            pass # In case of file I/O errors, we simply skip logging for that step
+
 
     return output
